@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -972,6 +973,11 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
             else:
                 PoolCls = DSATokenToKVPool
+            if not self.enable_hisparse and not self.is_draft_worker:
+                pool_kwargs["skip_topk_layers"] = [
+                    dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                    for layer_id in range(self.start_layer, self.end_layer)
+                ]
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
