@@ -30,6 +30,7 @@ from typing import Any, Awaitable, Callable, List, Optional, Tuple
 
 import aiohttp
 import numpy as np
+import psutil
 import requests
 import torch
 import torch.nn.functional as F
@@ -882,6 +883,104 @@ def _wait_for_server_health(
     return False, "Server failed to start within the timeout period"
 
 
+def _process_tree_snapshot(pid):
+    """(pid, create_time) pairs for a process and its recursive children."""
+    try:
+        proc = psutil.Process(pid)
+        return [
+            (p.pid, p.create_time()) for p in [proc] + proc.children(recursive=True)
+        ]
+    except psutil.NoSuchProcess:
+        return []
+
+
+def _wait_for_process_tree_exit(tree, timeout=120):
+    """Block until every process in ``tree`` has exited, or ``timeout`` passes.
+
+    ``kill_process_tree`` only delivers signals. On GPUs with slow context
+    teardown (>30s observed on GB300) a dying scheduler keeps its listen
+    ports until it fully exits, so relaunching a server on the same port
+    plan races it and dies with "rpc_port ... is used by a process
+    already". Wait for real exit before the ports are reused.
+    """
+    kill_time = time.time()
+    deadline = time.perf_counter() + timeout
+    alive = []
+    while time.perf_counter() < deadline:
+        alive = []
+        for pid, create_time in tree:
+            try:
+                p = psutil.Process(pid)
+                if (
+                    p.create_time() == create_time
+                    and p.status() != psutil.STATUS_ZOMBIE
+                ):
+                    alive.append(pid)
+            except psutil.NoSuchProcess:
+                continue
+        # Scheduler processes detach from the launcher during startup
+        # (reparented to PID 1), so a tree walk misses them; they self-exit
+        # on parent loss but slowly when GPU work is in flight. Match the
+        # orphans by their "sglang::" proc title. Caveat: a healthy sibling
+        # server's schedulers (PD-disagg tests) can also match, so this wait
+        # is timeout-bounded — worst case is a slower retry, never a hang.
+        for p in psutil.process_iter(["name", "create_time", "ppid"]):
+            try:
+                if (
+                    (p.info["name"] or "").startswith("sglang::")
+                    and p.info["ppid"] == 1
+                    and p.info["create_time"] < kill_time
+                    and p.status() != psutil.STATUS_ZOMBIE
+                ):
+                    alive.append(p.pid)
+            except psutil.NoSuchProcess:
+                continue
+        if not alive:
+            return True
+        time.sleep(1)
+    print(f"CI_OFFLINE: killed server tree still alive after {timeout}s: {alive}")
+    return False
+
+
+def _kill_stale_sglang_orphans():
+    """Kill sglang processes left behind by previous test runs.
+
+    A crashed or killed launch can leave a launcher or scheduler hung
+    indefinitely (>1h observed on GB300), squatting the port plan derived
+    from ``--port`` and failing every later launch on the runner with
+    "rpc_port ... is used by a process already" — a wait of any length
+    cannot outlive it. The leftovers are not always reparented to PID 1
+    (a hung launcher keeps its schedulers chained to it), so match by age
+    instead: any sglang-named process created before the current test
+    process is by definition not ours, while legitimate concurrent servers
+    (e.g. PD-disagg siblings) are always spawned after it.
+    """
+    me = psutil.Process()
+    cutoff = me.create_time()
+    protected = {me.pid}
+    try:
+        protected.update(p.pid for p in me.parents())
+    except psutil.NoSuchProcess:
+        pass
+    stale = []
+    for p in psutil.process_iter(["name", "create_time"]):
+        try:
+            if (
+                (p.info["name"] or "").startswith("sglang")
+                and p.info["create_time"] < cutoff
+                and p.pid not in protected
+            ):
+                if p.status() == psutil.STATUS_ZOMBIE:
+                    continue
+                p.kill()
+                stale.append(p)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    if stale:
+        print(f"CI: killed stale sglang orphans: {[p.pid for p in stale]}")
+        psutil.wait_procs(stale, timeout=10)
+
+
 def popen_launch_server(
     model: str,
     base_url: str,
@@ -931,6 +1030,16 @@ def popen_launch_server(
     # kill_process_tree() while GPU teardown completes; give CI launches
     # teardown-sized patience (see wait_port_available).
     env.setdefault("SGLANG_WAIT_PORT_TIMEOUT", "120")
+
+    # A hung leftover from a previous run can squat this launch's port plan
+    # forever; clear such processes before the first attempt.
+    try:
+        from sglang.utils import is_in_ci as _is_in_ci
+
+        if _is_in_ci():
+            _kill_stale_sglang_orphans()
+    except Exception as e:
+        print(f"CI: stale process cleanup failed (non-fatal): {e}")
 
     # Store per-run marker path for potential invalidation
     per_run_marker_path = None
@@ -993,12 +1102,20 @@ def popen_launch_server(
             f"CI_OFFLINE: Offline launch failed ({error_msg}), retrying with online mode..."
         )
 
-        # Kill failed process
+        # Kill the failed process and wait for its whole tree to actually
+        # exit: a dying scheduler can hold the port plan long after
+        # kill_process_tree() returns (slow GPU teardown), and the retry
+        # below reuses the same ports.
         try:
+            tree = _process_tree_snapshot(process.pid)
             if process.poll() is None:
                 kill_process_tree(process.pid)
             else:
                 process.wait(timeout=5)
+            if not _wait_for_process_tree_exit(tree):
+                # Waiting didn't drain it — the leftovers are hung; kill the
+                # orphans directly so the retry's ports are actually free.
+                _kill_stale_sglang_orphans()
         except Exception as e:
             print(f"CI_OFFLINE: Error cleaning up failed offline process: {e}")
 
